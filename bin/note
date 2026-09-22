@@ -1,0 +1,672 @@
+#!/usr/bin/ruby
+# frozen_string_literal: true
+#
+# note — daily markdown notes with a try-style picker.
+#
+#   note                open the picker (fuzzy search + calendar)
+#   note today          open YYYY-MM-DD-daily.md (today)
+#   note yesterday      open yesterday's daily note
+#   note tomorrow       open tomorrow's daily note
+#   note 2026-09-20     open the daily note for that date
+#   note <name>         open YYYY-MM-DD-<name>.md (today), created if missing
+#   note ls             list notes (newest first)
+#   note path           print the notes directory
+#
+# Notes live in $NOTE_PATH (default ~/notes). Editor: $VISUAL, $EDITOR, or nvim.
+# TUI/fuzzy libs are vendored from tobi/try (MIT) in ../lib next to this script.
+
+require "io/console"
+require "date"
+require "fileutils"
+require "set"
+
+LIB_DIR = File.expand_path("../lib", File.dirname(File.realpath(__FILE__)))
+$LOAD_PATH.unshift(LIB_DIR)
+require "tui"
+require "fuzzy"
+
+NOTE_PATH = File.expand_path(ENV["NOTE_PATH"] || "~/notes")
+DAILY = "daily"
+WEEKDAYS_RU = %w[понедельник вторник среда четверг пятница суббота воскресенье].freeze
+
+module NoteFiles
+  module_function
+
+  def ensure_dir
+    FileUtils.mkdir_p(NOTE_PATH)
+  end
+
+  def path_for(date, name)
+    slug = name.to_s.strip.gsub(/\s+/, "-").gsub(%r{[/\\]}, "-")
+    File.join(NOTE_PATH, "#{date.strftime('%Y-%m-%d')}-#{slug}.md")
+  end
+
+  def template(date, name)
+    if name == DAILY
+      weekday = WEEKDAYS_RU[date.wday.zero? ? 6 : date.wday - 1]
+      "# #{date.strftime('%Y-%m-%d')} · #{weekday}\n\n## Заметки\n\n\n## Сегодня\n\n- [ ] \n"
+    else
+      "# #{name}\n\n"
+    end
+  end
+
+  def create_if_missing(path, date, name)
+    return if File.exist?(path)
+    ensure_dir
+    File.write(path, template(date, name))
+  end
+
+  def editor_command
+    cmd = ENV["VISUAL"].to_s.strip
+    cmd = ENV["EDITOR"].to_s.strip if cmd.empty?
+    cmd = "nvim" if cmd.empty?
+    cmd.split(" ")
+  end
+
+  def open_in_editor(path)
+    exec(*editor_command, path)
+  end
+
+  def all_notes
+    ensure_dir
+    now = Time.now
+    notes = []
+    Dir.foreach(NOTE_PATH) do |entry|
+      next if entry.start_with?(".")
+      next unless entry.end_with?(".md")
+      path = File.join(NOTE_PATH, entry)
+      begin
+        stat = File.stat(path)
+      rescue Errno::ENOENT, Errno::EACCES
+        next
+      end
+      next unless stat.file?
+      mtime = stat.mtime
+      hours = (now - mtime) / 3600.0
+      base_score = 3.0 / Math.sqrt(hours + 1)
+      base_score += 2.0 if entry.match?(/^\d{4}-\d{2}-\d{2}-/)
+      notes << {
+        text: entry.delete_suffix(".md"),
+        basename: entry.delete_suffix(".md"),
+        path: path,
+        mtime: mtime,
+        size: stat.size,
+        base_score: base_score
+      }
+    end
+    notes
+  end
+end
+
+class NotePicker
+  include Tui::Helpers
+
+  CONTROL_RE = /[\x00-\x1f\x7f]/
+  WORD_CHAR_RE = /[[:alnum:]]/
+
+  NoteEntry = Data.define(:data, :score, :highlight_positions) do
+    def [](key)
+      case key
+      when :score then score
+      when :highlight_positions then highlight_positions
+      else data[key]
+      end
+    end
+  end
+
+  def initialize(initial = "")
+    @input_buffer = initial.gsub(/\s+/, "-")
+    @input_cursor_pos = @input_buffer.length
+    @cursor_pos = 0
+    @scroll_offset = 0
+    @selected = nil
+    @all_notes = nil
+    @fuzzy = nil
+    @last_query = nil
+    @cached = nil
+    @marked = []
+    @delete_mode = false
+    @status = nil
+    @needs_redraw = false
+    @month = Date.today
+  end
+
+  def run
+    unless STDIN.tty? && STDERR.tty?
+      STDERR.puts "note: requires an interactive terminal"
+      return nil
+    end
+    setup_terminal
+    STDERR.raw { main_loop }
+  ensure
+    restore_terminal
+  end
+
+  private
+
+  # ---------- terminal ----------
+
+  def setup_terminal
+    STDERR.print("#{Tui::ANSI::ALT_SCREEN_ON}#{Tui::ANSI::CURSOR_BLINK}")
+    @old_winch = Signal.trap("WINCH") { @needs_redraw = true }
+  end
+
+  def restore_terminal
+    STDERR.print(Tui::ANSI::RESET, Tui::ANSI::CURSOR_DEFAULT, Tui::ANSI::SHOW, Tui::ANSI::ALT_SCREEN_OFF)
+    Signal.trap("WINCH", @old_winch) if @old_winch
+  end
+
+  def clear_screen
+    STDERR.print("\e[2J\e[H")
+  end
+
+  def read_key
+    loop do
+      if @needs_redraw
+        @needs_redraw = false
+        clear_screen
+        return nil
+      end
+      ready = IO.select([STDIN], nil, nil, 0.1)
+      return read_keypress if ready
+    end
+  end
+
+  def read_keypress
+    input = STDIN.getc
+    return nil if input.nil?
+    if input == "\e"
+      begin
+        input << STDIN.read_nonblock(3)
+        input << STDIN.read_nonblock(2)
+      rescue IO::WaitReadable, EOFError
+      end
+    end
+    input
+  end
+
+  # ---------- data ----------
+
+  def load_notes
+    @all_notes ||= NoteFiles.all_notes
+  end
+
+  def invalidate
+    @all_notes = nil
+    @fuzzy = nil
+    @last_query = nil
+    @cached = nil
+  end
+
+  def notes
+    load_notes
+    @fuzzy ||= Fuzzy.new(@all_notes)
+    return @cached if @last_query == @input_buffer && @cached
+    @last_query = @input_buffer
+    height = IO.console&.winsize&.first || 24
+    max_results = [height - 6, 3].max
+    @cached = @fuzzy.match(@input_buffer).limit(max_results).map do |entry, positions, score|
+      NoteEntry.new(entry, score, positions)
+    end
+  end
+
+  def note_dates
+    @note_dates ||= load_notes.each_with_object(Set.new) do |n, set|
+      set << n[:basename][0, 10] if n[:basename].match?(/^\d{4}-\d{2}-\d{2}-/)
+    end
+  end
+
+  def calendar_month
+    if @input_buffer =~ /^(\d{4})-(\d{2})/
+      begin
+        return Date.new($1.to_i, $2.to_i, 1)
+      rescue Date::Error
+      end
+    end
+    @month
+  end
+
+  def shift_month(delta)
+    base = calendar_month
+    @month = base >> delta
+    @input_buffer = @month.strftime("%Y-%m")
+    @input_cursor_pos = @input_buffer.length
+    @cursor_pos = 0
+  end
+
+  # ---------- loop ----------
+
+  def main_loop
+    loop do
+      list = notes
+      show_create = !@input_buffer.empty? && !@input_buffer.match?(/^\d{4}-\d{2}$/)
+      total = list.length + (show_create ? 1 : 0)
+      @cursor_pos = [[@cursor_pos, 0].max, [total - 1, 0].max].min
+
+      render(list, show_create)
+
+      key = read_key
+      next unless key
+
+      case key
+      when "\r"
+        if @delete_mode && !@marked.empty?
+          confirm_delete(list)
+        elsif @cursor_pos < list.length
+          @selected = { type: :open, path: list[@cursor_pos][:path] }
+          break
+        elsif show_create
+          create_new
+          break if @selected
+        end
+      when "\e[A", "\x10" then @cursor_pos = [@cursor_pos - 1, 0].max
+      when "\e[B", "\x0E" then @cursor_pos = [@cursor_pos + 1, total - 1].min
+      when "\e[5~", "\e[1;5D" then shift_month(-1)
+      when "\e[6~", "\e[1;5C" then shift_month(1)
+      when "\e[C" then @input_cursor_pos = [@input_cursor_pos + 1, @input_buffer.length].min
+      when "\e[D" then @input_cursor_pos = [@input_cursor_pos - 1, 0].max
+      when "\x7F", "\b"
+        if @input_cursor_pos > 0
+          @input_buffer = @input_buffer[0...(@input_cursor_pos - 1)] + @input_buffer[@input_cursor_pos..]
+          @input_cursor_pos -= 1
+        end
+        @cursor_pos = 0
+      when "\x01" then @input_cursor_pos = 0
+      when "\x05" then @input_cursor_pos = @input_buffer.length
+      when "\x0B" then @input_buffer = @input_buffer[0...@input_cursor_pos]
+      when "\x15"
+        @input_buffer = +""
+        @input_cursor_pos = 0
+        @cursor_pos = 0
+      when "\x17"
+        if @input_cursor_pos > 0
+          new_pos = word_boundary_backward(@input_buffer, @input_cursor_pos)
+          @input_buffer = @input_buffer[0...new_pos] + @input_buffer[@input_cursor_pos..]
+          @input_cursor_pos = new_pos
+        end
+      when "\x04"
+        if @cursor_pos < list.length
+          path = list[@cursor_pos][:path]
+          if @marked.include?(path)
+            @marked.delete(path)
+          else
+            @marked << path
+            @delete_mode = true
+          end
+          @delete_mode = false if @marked.empty?
+        end
+      when "\x12"
+        rename_dialog(list[@cursor_pos]) if @cursor_pos < list.length
+      when "\x14"
+        @selected = { type: :open, path: daily_path(Date.today) }
+        break
+      when "\x03", "\e"
+        if @delete_mode
+          @marked.clear
+          @delete_mode = false
+        else
+          @selected = nil
+          break
+        end
+      when String
+        if key.length == 1 && !key.match?(CONTROL_RE)
+          ch = key == " " ? "-" : key
+          @input_buffer = @input_buffer[0...@input_cursor_pos] + ch + @input_buffer[@input_cursor_pos..]
+          @input_cursor_pos += 1
+          @cursor_pos = 0
+        end
+      end
+    end
+    @selected
+  end
+
+  def daily_path(date)
+    path = NoteFiles.path_for(date, DAILY)
+    NoteFiles.create_if_missing(path, date, DAILY)
+    path
+  end
+
+  def create_new
+    name = @input_buffer.gsub(/\s+/, "-")
+    return if name.empty?
+    date = Date.today
+    if name =~ /^(\d{4}-\d{2}-\d{2})-(.+)$/
+      begin
+        date = Date.parse($1)
+        name = $2
+      rescue Date::Error
+      end
+    end
+    path = NoteFiles.path_for(date, name)
+    NoteFiles.create_if_missing(path, date, name)
+    @selected = { type: :open, path: path }
+  end
+
+  def word_boundary_backward(buffer, cursor)
+    pos = cursor - 1
+    pos -= 1 while pos >= 0 && !buffer[pos].match?(WORD_CHAR_RE)
+    pos -= 1 while pos >= 0 && buffer[pos].match?(WORD_CHAR_RE)
+    pos + 1
+  end
+
+  # ---------- dialogs ----------
+
+  def prompt_line(title, prefix, initial = "")
+    clear_screen
+    STDERR.print(Tui::ANSI::SHOW)
+    STDERR.puts title
+    STDERR.puts
+    STDERR.print("> #{prefix}")
+    STDERR.flush
+    answer = nil
+    STDERR.cooked do
+      STDIN.iflush
+      answer = STDIN.gets&.chomp
+    end
+    answer
+  ensure
+    STDERR.print(Tui::ANSI::HIDE)
+  end
+
+  def rename_dialog(entry)
+    old_base = entry[:basename]
+    prefix = old_base =~ /^(\d{4}-\d{2}-\d{2}-)/ ? $1 : ""
+    answer = prompt_line("Rename note (leave empty to cancel)", prefix)
+    return if answer.nil? || answer.strip.empty?
+    new_base = "#{prefix}#{answer.strip.gsub(/\s+/, '-')}"
+    new_path = File.join(NOTE_PATH, "#{new_base}.md")
+    if File.exist?(new_path)
+      @status = "Rename failed: #{new_base}.md already exists"
+      return
+    end
+    File.rename(entry[:path], new_path)
+    @status = "Renamed to #{new_base}.md"
+    invalidate
+    @note_dates = nil
+  end
+
+  def confirm_delete(list)
+    items = list.select { |n| @marked.include?(n[:path]) }
+    return if items.empty?
+    names = items.map { |n| n[:basename] }
+    title = "Move #{items.length} note#{items.length == 1 ? '' : 's'} to trash?\n  " + names.join("\n  ") + "\n\nType yes to confirm"
+    answer = prompt_line(title, "")
+    if answer.to_s.strip.downcase == "yes"
+      items.each { |n| trash(n[:path]) }
+      @status = "Trashed #{items.length} note#{items.length == 1 ? '' : 's'}"
+      invalidate
+      @note_dates = nil
+    else
+      @status = "Delete cancelled"
+    end
+    @marked.clear
+    @delete_mode = false
+    @cursor_pos = 0
+  end
+
+  def trash(path)
+    ok = system("gio", "trash", path, out: File::NULL, err: File::NULL)
+    File.delete(path) unless ok || !File.exist?(path)
+  end
+
+  # ---------- render ----------
+
+  def render(list, show_create)
+    screen = Tui::Screen.new(io: STDERR)
+    width = screen.width
+    height = screen.height
+
+    screen.header.add_line { |l| l.write << emoji("📝") << Tui::Text.accent(" Notes") << Tui::Text.dim("  #{NOTE_PATH.sub(Dir.home, '~')}") }
+    screen.header.add_line { |l| l.write.write_dim(fill("─")) }
+    screen.header.add_line do |l|
+      prefix = "Search: "
+      l.write.write_dim(prefix)
+      l.write << screen.input("", value: @input_buffer, cursor: @input_cursor_pos).to_s
+      l.mark_has_input(Tui::Metrics.visible_width(prefix))
+    end
+    screen.header.add_line { |l| l.write.write_dim(fill("─")) }
+    render_calendar(screen) if height >= 22
+    screen.header.add_line { |l| l.write.write_dim(fill("─")) } if height >= 22
+
+    screen.footer.add_line { |l| l.write.write_dim(fill("─")) }
+    if @status
+      screen.footer.add_line { |l| l.write.write_bold(@status) }
+      @status = nil
+    elsif @delete_mode
+      screen.footer.add_line(background: Tui::Palette::DANGER_BG) do |l|
+        l.write.write_bold(" DELETE MODE ")
+        l.write << " #{@marked.length} marked  |  Ctrl-D: Toggle  Enter: Confirm  Esc: Cancel"
+      end
+    else
+      screen.footer.add_line do |l|
+        l.center.write_dim("↑/↓: Navigate  Enter: Open  ^T: Today  ^R: Rename  ^D: Delete  PgUp/PgDn: Month  Esc: Cancel")
+      end
+    end
+
+    header_lines = screen.header.lines.length
+    footer_lines = screen.footer.lines.length
+    max_visible = [height - header_lines - footer_lines, 3].max
+    total = list.length + (show_create ? 1 : 0)
+
+    if @cursor_pos < @scroll_offset
+      @scroll_offset = @cursor_pos
+    elsif @cursor_pos >= @scroll_offset + max_visible
+      @scroll_offset = @cursor_pos - max_visible + 1
+    end
+    visible_end = [@scroll_offset + max_visible, total].min
+
+    (@scroll_offset...visible_end).each do |idx|
+      screen.body.add_line if idx == list.length && list.any?
+      if idx < list.length
+        render_entry(screen, list[idx], idx == @cursor_pos, width)
+      else
+        render_create(screen, idx == @cursor_pos)
+      end
+    end
+
+    if list.empty? && !show_create
+      msg = if @input_buffer.match?(/^\d{4}-\d{2}$/)
+        "  No notes in #{calendar_month.strftime('%B %Y')}. PgUp/PgDn to change month, ^U to clear."
+      else
+        "  No notes yet. Type a name and press Enter, or ^T for today's note."
+      end
+      screen.body.add_line { |l| l.write.write_dim(msg) }
+    end
+
+    screen.flush
+  end
+
+  def render_calendar(screen)
+    month = calendar_month
+    today = Date.today
+    first = Date.new(month.year, month.month, 1)
+    last = (first >> 1) - 1
+    dates = note_dates
+
+    title = first.strftime("%B %Y")
+    screen.header.add_line do |l|
+      l.write << "  " << Tui::Text.accent(title)
+      l.write.write_dim("   (#{dates.count { |d| d.start_with?(first.strftime('%Y-%m')) }} notes)")
+    end
+    screen.header.add_line { |l| l.write.write_dim("  Mo Tu We Th Fr Sa Su") }
+
+    offset = (first.wday + 6) % 7
+    cells = Array.new(offset, nil) + (first..last).to_a
+    cells.each_slice(7) do |week|
+      screen.header.add_line do |l|
+        buf = String.new("  ")
+        week.each_with_index do |d, i|
+          if d.nil?
+            buf << "  "
+          else
+            key = d.strftime("%Y-%m-%d")
+            text = format("%2d", d.day)
+            buf << if d == today
+              "#{Tui::Palette::SELECTED_BG}#{Tui::ANSI::BOLD}#{text}#{Tui::ANSI::RESET}"
+            elsif dates.include?(key)
+              Tui::Text.highlight(text)
+            else
+              Tui::Text.dim(text)
+            end
+          end
+          buf << " " if i < week.length - 1
+        end
+        l.write << buf
+      end
+    end
+  end
+
+  def render_entry(screen, entry, selected, width)
+    marked = @marked.include?(entry[:path])
+    background = if marked
+      Tui::Palette::DANGER_BG
+    elsif selected
+      Tui::Palette::SELECTED_BG
+    end
+    line = screen.body.add_line(background: background)
+    line.write << (selected ? Tui::Text.highlight("→ ") : "  ")
+    line.write << (marked ? emoji("🗑️") : emoji("📝")) << " "
+
+    plain, rendered = formatted_name(entry)
+    max_name = width - 6
+    rendered = Tui::Metrics.truncate(rendered, max_name) if plain.length > max_name && max_name > 2
+    line.write << rendered
+    line.right.write_dim("#{relative_time(entry[:mtime])}, #{human_size(entry[:size])}")
+  end
+
+  def render_create(screen, selected)
+    line = screen.body.add_line(background: selected ? Tui::Palette::SELECTED_BG : nil)
+    line.write << (selected ? Tui::Text.highlight("→ ") : "  ")
+    name = @input_buffer
+    label = if name =~ /^\d{4}-\d{2}-\d{2}-.+/
+      "#{name}.md"
+    else
+      "#{Date.today.strftime('%Y-%m-%d')}-#{name}.md"
+    end
+    line.write << emoji("📄") << " Create new: #{label}"
+  end
+
+  def formatted_name(entry)
+    base = entry[:basename]
+    positions = entry[:highlight_positions] || []
+    if base =~ /^(\d{4}-\d{2}-\d{2})-(.+)$/
+      date_part = $1
+      name_part = $2
+      rendered = Tui::Text.dim(date_part)
+      rendered += positions.include?(10) ? Tui::Text.highlight("-") : Tui::Text.dim("-")
+      rendered += highlight_positions(name_part, positions, date_part.length + 1)
+      [base, rendered]
+    else
+      [base, highlight_positions(base, positions, 0)]
+    end
+  end
+
+  def highlight_positions(text, positions, offset)
+    set = positions.is_a?(Set) ? positions : positions.to_set
+    result = String.new
+    chars = text.chars
+    i = 0
+    while i < chars.length
+      if set.include?(i + offset)
+        start = i
+        i += 1
+        i += 1 while i < chars.length && set.include?(i + offset)
+        result << Tui::Text.highlight(chars[start...i].join)
+      else
+        result << chars[i]
+        i += 1
+      end
+    end
+    result
+  end
+
+  def relative_time(time)
+    seconds = Time.now - time
+    minutes = seconds / 60
+    hours = minutes / 60
+    days = hours / 24
+    if seconds < 60 then "just now"
+    elsif minutes < 60 then "#{minutes.to_i}m ago"
+    elsif hours < 24 then "#{hours.to_i}h ago"
+    elsif days < 7 then "#{days.to_i}d ago"
+    else "#{(days / 7).to_i}w ago"
+    end
+  end
+
+  def human_size(bytes)
+    if bytes < 1024 then "#{bytes} B"
+    elsif bytes < 1024 * 1024 then format("%.1f KB", bytes / 1024.0)
+    else format("%.1f MB", bytes / 1024.0 / 1024.0)
+    end
+  end
+end
+
+# ---------- CLI ----------
+
+def usage
+  puts <<~TXT
+    note — daily markdown notes (#{NOTE_PATH.sub(Dir.home, '~')})
+
+      note                 picker: fuzzy search + calendar
+      note today           today's daily note      (YYYY-MM-DD-daily.md)
+      note yesterday       yesterday's daily note
+      note tomorrow        tomorrow's daily note
+      note 2026-09-20      daily note for that date
+      note <name>          today's note "<name>"   (YYYY-MM-DD-<name>.md)
+      note ls              list notes, newest first
+      note path            print notes directory
+
+    Picker keys: type to filter · ↑/↓ · Enter open/create · ^T today · ^R rename
+                 ^D mark + Enter trash · PgUp/PgDn month · Esc quit
+    Env: NOTE_PATH (notes dir), VISUAL/EDITOR (editor)
+  TXT
+end
+
+def open_daily(date)
+  path = NoteFiles.path_for(date, DAILY)
+  NoteFiles.create_if_missing(path, date, DAILY)
+  NoteFiles.open_in_editor(path)
+end
+
+args = ARGV.dup
+case args.first
+when "-h", "--help", "help"
+  usage
+when "path"
+  puts NOTE_PATH
+when "ls", "list"
+  NoteFiles.all_notes.sort_by { |n| -n[:mtime].to_i }.each do |n|
+    puts format("%-10s  %s", n[:mtime].strftime("%Y-%m-%d"), n[:basename])
+  end
+when "today", "daily"
+  open_daily(Date.today)
+when "yesterday"
+  open_daily(Date.today - 1)
+when "tomorrow"
+  open_daily(Date.today + 1)
+when /\A\d{4}-\d{2}-\d{2}\z/
+  begin
+    open_daily(Date.parse(args.first))
+  rescue Date::Error
+    warn "note: invalid date #{args.first}"
+    exit 1
+  end
+when nil
+  result = NotePicker.new.run
+  if result && result[:type] == :open
+    NoteFiles.open_in_editor(result[:path])
+  end
+else
+  name = args.join(" ").strip.gsub(/\s+/, "-")
+  date = Date.today
+  if name =~ /\A(\d{4}-\d{2}-\d{2})-(.+)\z/
+    begin
+      date = Date.parse($1)
+      name = $2
+    rescue Date::Error
+    end
+  end
+  path = NoteFiles.path_for(date, name)
+  NoteFiles.create_if_missing(path, date, name)
+  NoteFiles.open_in_editor(path)
+end
