@@ -21,6 +21,7 @@ note path            print notes directory
 - No match? The last row offers `Create new: YYYY-MM-DD-<query>.md`.
 - Calendar on top: days with notes are highlighted, today has a background.
 - `PgUp` / `PgDn` (or `Ctrl-←` / `Ctrl-→`) move the calendar by a month and filter the list to it. `Ctrl-U` clears the filter.
+- `Tab` focuses the calendar. There `←`/`→` move by day, `↑`/`↓` by week, `PgUp`/`PgDn` by month; the list shows that day's notes. `Enter` opens the day's daily note (created if missing). Start typing to create a new note for that day: the search field is prefilled with `YYYY-MM-DD-`. `Tab` or `Esc` returns to the search field.
 - `Ctrl-T` opens today's daily note directly.
 - `Ctrl-R` renames the selected note (date prefix is kept).
 - `Ctrl-D` marks notes, `Enter` moves them to trash (`gio trash`) after typing `yes`.

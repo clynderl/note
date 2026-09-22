@@ -129,6 +129,9 @@ class NotePicker
     @status = nil
     @needs_redraw = false
     @month = Date.today
+    @cal_focus = false        # true while the calendar has keyboard focus
+    @cal_date = Date.today    # selected day in the calendar
+    @quit = false
   end
 
   def run
@@ -200,6 +203,7 @@ class NotePicker
 
   def notes
     load_notes
+    return notes_for_day(@cal_date) if @cal_focus
     @fuzzy ||= Fuzzy.new(@all_notes)
     return @cached if @last_query == @input_buffer && @cached
     @last_query = @input_buffer
@@ -210,6 +214,18 @@ class NotePicker
     end
   end
 
+  # Exact-prefix list for one day (used while the calendar is focused)
+  def notes_for_day(date)
+    prefix = date.strftime("%Y-%m-%d-")
+    load_notes.select { |n| n[:basename].start_with?(prefix) }
+              .sort_by { |n| -n[:mtime].to_i }
+              .map { |n| NoteEntry.new(n, 0.0, []) }
+  end
+
+  def daily_exists?(date)
+    File.exist?(NoteFiles.path_for(date, DAILY))
+  end
+
   def note_dates
     @note_dates ||= load_notes.each_with_object(Set.new) do |n, set|
       set << n[:basename][0, 10] if n[:basename].match?(/^\d{4}-\d{2}-\d{2}-/)
@@ -217,6 +233,7 @@ class NotePicker
   end
 
   def calendar_month
+    return Date.new(@cal_date.year, @cal_date.month, 1) if @cal_focus
     if @input_buffer =~ /^(\d{4})-(\d{2})/
       begin
         return Date.new($1.to_i, $2.to_i, 1)
@@ -227,10 +244,32 @@ class NotePicker
   end
 
   def shift_month(delta)
+    if @cal_focus
+      move_day(@cal_date >> delta)
+      return
+    end
     base = calendar_month
     @month = base >> delta
+    @cal_date = @month
     @input_buffer = @month.strftime("%Y-%m")
     @input_cursor_pos = @input_buffer.length
+    @cursor_pos = 0
+  end
+
+  def move_day(date)
+    @cal_date = date
+    @month = Date.new(date.year, date.month, 1)
+    @cursor_pos = 0
+  end
+
+  def enter_calendar
+    @cal_focus = true
+    @cal_date = calendar_month == Date.new(Date.today.year, Date.today.month, 1) ? Date.today : calendar_month
+    @cursor_pos = 0
+  end
+
+  def leave_calendar
+    @cal_focus = false
     @cursor_pos = 0
   end
 
@@ -239,7 +278,11 @@ class NotePicker
   def main_loop
     loop do
       list = notes
-      show_create = !@input_buffer.empty? && !@input_buffer.match?(/^\d{4}-\d{2}$/)
+      show_create = if @cal_focus
+        !daily_exists?(@cal_date)
+      else
+        !@input_buffer.empty? && !@input_buffer.match?(/^\d{4}-\d{2}$/)
+      end
       total = list.length + (show_create ? 1 : 0)
       @cursor_pos = [[@cursor_pos, 0].max, [total - 1, 0].max].min
 
@@ -248,7 +291,15 @@ class NotePicker
       key = read_key
       next unless key
 
+      if @cal_focus
+        handle_calendar_key(key, list, total)
+        break if @selected || @quit
+        next
+      end
+
       case key
+      when "\t"
+        enter_calendar
       when "\r"
         if @delete_mode && !@marked.empty?
           confirm_delete(list)
@@ -320,6 +371,42 @@ class NotePicker
     @selected
   end
 
+  # Keys while the calendar has focus. The list below shows that day's notes;
+  # Enter on a list row opens it, Enter on the create row (or with an empty
+  # list) opens the daily note for the selected day, creating it if needed.
+  # Typing a character starts a new note for that day and returns focus to
+  # the search field with "YYYY-MM-DD-<char>" prefilled.
+  def handle_calendar_key(key, list, total)
+    case key
+    when "\e[D" then move_day(@cal_date - 1)
+    when "\e[C" then move_day(@cal_date + 1)
+    when "\e[A" then move_day(@cal_date - 7)
+    when "\e[B" then move_day(@cal_date + 7)
+    when "\e[5~", "\e[1;5D" then move_day(@cal_date << 1)
+    when "\e[6~", "\e[1;5C" then move_day(@cal_date >> 1)
+    when "\x10" then @cursor_pos = [@cursor_pos - 1, 0].max            # Ctrl-P: list up
+    when "\x0E" then @cursor_pos = [@cursor_pos + 1, total - 1].min    # Ctrl-N: list down
+    when "\x14" then move_day(Date.today)
+    when "\r"
+      if @cursor_pos < list.length
+        @selected = { type: :open, path: list[@cursor_pos][:path] }
+      else
+        @selected = { type: :open, path: daily_path(@cal_date) }
+      end
+    when "\t", "\e"
+      leave_calendar
+    when "\x03"
+      @quit = true
+    when String
+      if key.length == 1 && !key.match?(CONTROL_RE)
+        ch = key == " " ? "-" : key
+        @input_buffer = "#{@cal_date.strftime('%Y-%m-%d')}-#{ch}"
+        @input_cursor_pos = @input_buffer.length
+        leave_calendar
+      end
+    end
+  end
+
   def daily_path(date)
     path = NoteFiles.path_for(date, DAILY)
     NoteFiles.create_if_missing(path, date, DAILY)
@@ -330,7 +417,14 @@ class NotePicker
     name = @input_buffer.gsub(/\s+/, "-")
     return if name.empty?
     date = Date.today
-    if name =~ /^(\d{4}-\d{2}-\d{2})-(.+)$/
+    if name =~ /^(\d{4}-\d{2}-\d{2})-?$/
+      # bare date: daily note for that day
+      begin
+        date = Date.parse($1)
+        name = DAILY
+      rescue Date::Error
+      end
+    elsif name =~ /^(\d{4}-\d{2}-\d{2})-(.+)$/
       begin
         date = Date.parse($1)
         name = $2
@@ -421,12 +515,22 @@ class NotePicker
     screen.header.add_line do |l|
       prefix = "Search: "
       l.write.write_dim(prefix)
-      l.write << screen.input("", value: @input_buffer, cursor: @input_cursor_pos).to_s
-      l.mark_has_input(Tui::Metrics.visible_width(prefix))
+      if @cal_focus
+        l.write.write_dim(@input_buffer.empty? ? "(Tab: back to search)" : @input_buffer)
+      else
+        l.write << screen.input("", value: @input_buffer, cursor: @input_cursor_pos).to_s
+        l.mark_has_input(Tui::Metrics.visible_width(prefix))
+      end
     end
     screen.header.add_line { |l| l.write.write_dim(fill("─")) }
-    render_calendar(screen) if height >= 22
-    screen.header.add_line { |l| l.write.write_dim(fill("─")) } if height >= 22
+    show_calendar = height >= 22 || @cal_focus
+    render_calendar(screen) if show_calendar
+    if @cal_focus
+      screen.header.add_line do |l|
+        l.write.write_dim("  ") << Tui::Text.accent(@cal_date.strftime("%Y-%m-%d")) << Tui::Text.dim(" · #{WEEKDAYS_RU[(@cal_date.wday + 6) % 7]}")
+      end
+    end
+    screen.header.add_line { |l| l.write.write_dim(fill("─")) } if show_calendar
 
     screen.footer.add_line { |l| l.write.write_dim(fill("─")) }
     if @status
@@ -437,9 +541,13 @@ class NotePicker
         l.write.write_bold(" DELETE MODE ")
         l.write << " #{@marked.length} marked  |  Ctrl-D: Toggle  Enter: Confirm  Esc: Cancel"
       end
+    elsif @cal_focus
+      screen.footer.add_line do |l|
+        l.center.write_dim("←/→ day  ↑/↓ week  PgUp/PgDn month  Enter: daily note  type: new note  ^T today  Tab: back")
+      end
     else
       screen.footer.add_line do |l|
-        l.center.write_dim("↑/↓: Navigate  Enter: Open  ^T: Today  ^R: Rename  ^D: Delete  PgUp/PgDn: Month  Esc: Cancel")
+        l.center.write_dim("↑/↓ navigate  Enter open  Tab calendar  ^T today  ^R rename  ^D delete  PgUp/PgDn month  Esc quit")
       end
     end
 
@@ -501,9 +609,13 @@ class NotePicker
           else
             key = d.strftime("%Y-%m-%d")
             text = format("%2d", d.day)
-            buf << if d == today
+            has_note = dates.include?(key)
+            buf << if @cal_focus && d == @cal_date
+              color = has_note ? Tui::Palette::HIGHLIGHT : ""
+              "\e[7m#{color}#{text}#{Tui::ANSI::RESET}"
+            elsif d == today
               "#{Tui::Palette::SELECTED_BG}#{Tui::ANSI::BOLD}#{text}#{Tui::ANSI::RESET}"
-            elsif dates.include?(key)
+            elsif has_note
               Tui::Text.highlight(text)
             else
               Tui::Text.dim(text)
@@ -538,7 +650,11 @@ class NotePicker
     line = screen.body.add_line(background: selected ? Tui::Palette::SELECTED_BG : nil)
     line.write << (selected ? Tui::Text.highlight("→ ") : "  ")
     name = @input_buffer
-    label = if name =~ /^\d{4}-\d{2}-\d{2}-.+/
+    label = if @cal_focus
+      "#{@cal_date.strftime('%Y-%m-%d')}-#{DAILY}.md"
+    elsif name =~ /^(\d{4}-\d{2}-\d{2})-?$/
+      "#{$1}-#{DAILY}.md"
+    elsif name =~ /^\d{4}-\d{2}-\d{2}-.+/
       "#{name}.md"
     else
       "#{Date.today.strftime('%Y-%m-%d')}-#{name}.md"
